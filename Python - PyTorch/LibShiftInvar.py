@@ -17,48 +17,6 @@ else:
     REAL_TYPE = torch.float32
     SMALL_ENOUGH = 1e-5
 
-
-def _pair(v):
-    return v if isinstance(v, tuple) else (v, v)
-
-def _keras_same_pad_1d(in_size, kernel_size, stride):
-    out_size = int(np.ceil(float(in_size) / float(stride)))
-    pad_total = max((out_size - 1) * stride + kernel_size - in_size, 0)
-    pad_before = pad_total // 2
-    pad_after = pad_total - pad_before
-    return pad_before, pad_after
-
-def _apply_keras_same_pad_nchw(x, kernel_size, stride):
-    kh, kw = _pair(kernel_size)
-    sh, sw = _pair(stride)
-    h, w = x.shape[2], x.shape[3]
-    pt, pb = _keras_same_pad_1d(h, kh, sh)
-    pl, pr = _keras_same_pad_1d(w, kw, sw)
-    if pt or pb or pl or pr:
-        x = F.pad(x, (pl, pr, pt, pb))
-    return x
-
-def _apply_activation(x, activation):
-    if activation == 'relu':
-        return F.relu(x)
-    if activation == 'swish':
-        return F.silu(x)
-    if activation == 'linear':
-        return x
-    raise ValueError(f'Unsupported activation: {activation}')
-
-def keras_conv2d_weight_to_torch(w):
-    return torch.as_tensor(w).permute(3, 2, 0, 1).contiguous()
-
-def torch_conv2d_weight_to_keras(w):
-    return w.detach().cpu().permute(2, 3, 1, 0).contiguous().numpy()
-
-def keras_conv2d_transpose_weight_to_torch(w):
-    return torch.as_tensor(w).permute(2, 3, 0, 1).contiguous()
-
-def torch_conv2d_transpose_weight_to_keras(w):
-    return w.detach().cpu().permute(2, 3, 0, 1).contiguous().numpy()
-
 ####################################################################
 # AddNoise is adapted from:
 # Copyright (C) 2021 by Santiago L. Valdarrama
@@ -103,8 +61,8 @@ class CircConv2D(nn.Module):
                  in_channels=None):
         super().__init__()
         self.filters = filters
-        self.kernel_size = _pair(kernel_size)
-        self.strides = _pair(strides)
+        self.kernel_size = kernel_size
+        self.strides = strides
         self.activation = activation
         self.kernel_initializer = kernel_initializer
         self.kernel_regularizer = kernel_regularizer
@@ -114,38 +72,26 @@ class CircConv2D(nn.Module):
             self._build(in_channels)
 
     def _build(self, in_channels):
+        stride_tuple = self.strides if type(self.strides) is tuple else (self.strides, self.strides)
         self.conv = nn.Conv2d(in_channels, self.filters, self.kernel_size,
-                              stride=self.strides, padding=0, bias=True,
+                              stride=stride_tuple, padding='same', bias=True,
                               dtype=REAL_TYPE)
         if self.kernel_initializer == 'glorot_uniform':
             nn.init.xavier_uniform_(self.conv.weight)
-        if self.conv.bias is not None:
-            nn.init.zeros_(self.conv.bias)
         self.in_channels = in_channels
-
-    def set_keras_weights(self, weights):
-        kernel = keras_conv2d_weight_to_torch(weights[0]).to(dtype=self.conv.weight.dtype, device=self.conv.weight.device)
-        self.conv.weight.data.copy_(kernel)
-        if len(weights) > 1 and self.conv.bias is not None:
-            bias = torch.as_tensor(weights[1], dtype=self.conv.bias.dtype, device=self.conv.bias.device)
-            self.conv.bias.data.copy_(bias)
-
-    def get_keras_weights(self):
-        weights = [torch_conv2d_weight_to_keras(self.conv.weight)]
-        if self.conv.bias is not None:
-            weights.append(self.conv.bias.detach().cpu().numpy())
-        return weights
 
     def forward(self, x):
         in_height = x.shape[1]
         in_width = x.shape[2]
 
+        # left and right paddings
         num_left = (self.kernel_size[1] - 1) // 2
         num_right = self.kernel_size[1] - 1 - num_left
         if num_left > 0:
             pad_left = x[:, :, (in_width - num_left):, :]
         if num_right > 0:
             pad_right = x[:, :, :num_right, :]
+        # add padding to incoming image
         if num_left > 0 and num_right < 1:
             x = torch.cat([pad_left, x], dim=2)
         elif num_left < 1 and num_right > 0:
@@ -153,12 +99,14 @@ class CircConv2D(nn.Module):
         elif num_left > 0 and num_right > 0:
             x = torch.cat([pad_left, x, pad_right], dim=2)
 
+        # top and bottom paddings
         num_top = (self.kernel_size[0] - 1) // 2
         num_bottom = self.kernel_size[0] - 1 - num_top
         if num_top > 0:
             pad_top = x[:, (in_height - num_top):, :, :]
         if num_bottom > 0:
             pad_bottom = x[:, :num_bottom, :, :]
+        # add padding to incoming image
         if num_top > 0 and num_bottom < 1:
             x = torch.cat([pad_top, x], dim=1)
         elif num_top < 1 and num_bottom > 0:
@@ -171,15 +119,26 @@ class CircConv2D(nn.Module):
             self.conv = self.conv.to(device=x.device, dtype=x.dtype)
 
         x = x.permute(0, 3, 1, 2).contiguous()
-        x = _apply_keras_same_pad_nchw(x, self.kernel_size, self.strides)
         x = self.conv(x)
         x = x.permute(0, 2, 3, 1).contiguous()
-        x = _apply_activation(x, self.activation)
 
-        new_top = max(num_top // self.strides[0], min(1, num_top))
-        new_left = max(num_left // self.strides[1], min(1, num_left))
-        out_height = in_height // self.strides[0]
-        out_width = in_width // self.strides[1]
+        if self.activation == 'relu':
+            x = F.relu(x)
+        elif self.activation == 'swish':
+            x = F.silu(x)
+        elif self.activation == 'linear':
+            pass
+        else:
+            raise ValueError(f'Unsupported activation: {self.activation}')
+
+        if type(self.strides) is tuple:
+            stride_tuple = self.strides
+        else:
+            stride_tuple = (self.strides, self.strides)
+        new_top = max(num_top // stride_tuple[0], min(1, num_top))
+        new_left = max(num_left // stride_tuple[1], min(1, num_left))
+        out_height = in_height // stride_tuple[0]
+        out_width = in_width // stride_tuple[1]
 
         x = x[:, new_top:(new_top + out_height), new_left:(new_left + out_width), :]
         return x
@@ -195,8 +154,8 @@ class CircConv2DTrans(nn.Module):
                  in_channels=None):
         super().__init__()
         self.filters = filters
-        self.kernel_size = _pair(kernel_size)
-        self.strides = _pair(strides)
+        self.kernel_size = kernel_size
+        self.strides = strides
         self.activation = activation
         self.kernel_initializer = kernel_initializer
         self.kernel_regularizer = kernel_regularizer
@@ -206,39 +165,37 @@ class CircConv2DTrans(nn.Module):
             self._build(in_channels)
 
     def _build(self, in_channels):
+        stride_tuple = self.strides if type(self.strides) is tuple else (self.strides, self.strides)
+        if isinstance(self.kernel_size, tuple):
+            padding_tuple = (self.kernel_size[0] // 2, self.kernel_size[1] // 2)
+        else:
+            padding_tuple = self.kernel_size // 2
+
+        if isinstance(stride_tuple, tuple):
+            output_padding_tuple = (stride_tuple[0] - 1, stride_tuple[1] - 1)
+        else:
+            output_padding_tuple = stride_tuple - 1
+
         self.conv = nn.ConvTranspose2d(in_channels, self.filters, self.kernel_size,
-                                       stride=self.strides, padding=0,
-                                       output_padding=0, bias=True,
+                                       stride=stride_tuple, padding=padding_tuple,
+                                       output_padding=output_padding_tuple, bias=True,
                                        dtype=REAL_TYPE)
         if self.kernel_initializer == 'glorot_uniform':
             nn.init.xavier_uniform_(self.conv.weight)
-        if self.conv.bias is not None:
-            nn.init.zeros_(self.conv.bias)
         self.in_channels = in_channels
-
-    def set_keras_weights(self, weights):
-        kernel = keras_conv2d_transpose_weight_to_torch(weights[0]).to(dtype=self.conv.weight.dtype, device=self.conv.weight.device)
-        self.conv.weight.data.copy_(kernel)
-        if len(weights) > 1 and self.conv.bias is not None:
-            bias = torch.as_tensor(weights[1], dtype=self.conv.bias.dtype, device=self.conv.bias.device)
-            self.conv.bias.data.copy_(bias)
-
-    def get_keras_weights(self):
-        weights = [torch_conv2d_transpose_weight_to_keras(self.conv.weight)]
-        if self.conv.bias is not None:
-            weights.append(self.conv.bias.detach().cpu().numpy())
-        return weights
 
     def forward(self, x):
         in_height = x.shape[1]
         in_width = x.shape[2]
 
+        # left and right paddings
         num_right = (self.kernel_size[1] - 1) // 2
         num_left = self.kernel_size[1] - 1 - num_right
         if num_left > 0:
             pad_left = x[:, :, (in_width - num_left):, :]
         if num_right > 0:
             pad_right = x[:, :, :num_right, :]
+        # add padding to incoming image
         if num_left > 0 and num_right < 1:
             x = torch.cat([pad_left, x], dim=2)
         elif num_left < 1 and num_right > 0:
@@ -246,12 +203,14 @@ class CircConv2DTrans(nn.Module):
         elif num_left > 0 and num_right > 0:
             x = torch.cat([pad_left, x, pad_right], dim=2)
 
+        # top and bottom paddings
         num_bottom = (self.kernel_size[0] - 1) // 2
         num_top = self.kernel_size[0] - 1 - num_bottom
         if num_top > 0:
             pad_top = x[:, (in_height - num_top):, :, :]
         if num_bottom > 0:
             pad_bottom = x[:, :num_bottom, :, :]
+        # add padding to incoming image
         if num_top > 0 and num_bottom < 1:
             x = torch.cat([pad_top, x], dim=1)
         elif num_top < 1 and num_bottom > 0:
@@ -263,38 +222,27 @@ class CircConv2DTrans(nn.Module):
             self._build(x.shape[3])
             self.conv = self.conv.to(device=x.device, dtype=x.dtype)
 
-        padded_height = x.shape[1]
-        padded_width = x.shape[2]
-        target_h = padded_height * self.strides[0]
-        target_w = padded_width * self.strides[1]
-
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.conv(x)
-
-        diff_h = x.shape[2] - target_h
-        diff_w = x.shape[3] - target_w
-        if diff_h > 0:
-            top = diff_h // 2
-            x = x[:, :, top:(top + target_h), :]
-        elif diff_h < 0:
-            pad_total = -diff_h
-            top = pad_total // 2
-            x = F.pad(x, (0, 0, top, pad_total - top))
-        if diff_w > 0:
-            left = diff_w // 2
-            x = x[:, :, :, left:(left + target_w)]
-        elif diff_w < 0:
-            pad_total = -diff_w
-            left = pad_total // 2
-            x = F.pad(x, (left, pad_total - left, 0, 0))
-
         x = x.permute(0, 2, 3, 1).contiguous()
-        x = _apply_activation(x, self.activation)
 
-        new_top = num_top * self.strides[0]
-        new_left = num_left * self.strides[1]
-        out_height = in_height * self.strides[0]
-        out_width = in_width * self.strides[1]
+        if self.activation == 'relu':
+            x = F.relu(x)
+        elif self.activation == 'swish':
+            x = F.silu(x)
+        elif self.activation == 'linear':
+            pass
+        else:
+            raise ValueError(f'Unsupported activation: {self.activation}')
+
+        if type(self.strides) is tuple:
+            stride_tuple = self.strides
+        else:
+            stride_tuple = (self.strides, self.strides)
+        new_top = num_top * stride_tuple[0]
+        new_left = num_left * stride_tuple[1]
+        out_height = in_height * stride_tuple[0]
+        out_width = in_width * stride_tuple[1]
 
         x = x[:, new_top:(new_top + out_height), new_left:(new_left + out_width), :]
         return x
