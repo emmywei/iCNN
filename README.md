@@ -167,7 +167,7 @@ Both U-Nets use encoder widths 32 and 64, a 128-channel bottleneck, skip connect
 
 ### Evaluation and outputs
 
-Shift variance is evaluated following Definition 3 in the manuscript by comparing the unshifted output with the corresponding input-forward, output-backward shifted result. For each MNIST shift, the largest \(L^\infty\) RSV across the test images is recorded. The experiments also report denoising losses, reader accuracy, and runtime.
+Shift variance is evaluated by comparing the unshifted output with the corresponding input-forward, output-backward shifted result. For each MNIST shift, the maximum absolute pixel-to-pixel difference across the test images is recorded. The experiments also report denoising losses, reader accuracy, and runtime.
 
 Essential generated files include:
 
